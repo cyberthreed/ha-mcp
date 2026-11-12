@@ -6,7 +6,6 @@ integration serves an entity of a test integration, so every reply is Core's.
 """
 
 import json
-from collections.abc import Iterator
 from contextlib import AbstractContextManager
 from typing import Any
 from unittest.mock import MagicMock, patch
