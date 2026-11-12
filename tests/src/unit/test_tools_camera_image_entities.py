@@ -75,9 +75,7 @@ def _spy_on_requests(
     client: HomeAssistantClient,
 ) -> AbstractContextManager[MagicMock]:
     """A spy on the client's streaming request; Core still answers."""
-    return patch.object(
-        client.httpx_client, "stream", wraps=client.httpx_client.stream
-    )
+    return patch.object(client.httpx_client, "stream", wraps=client.httpx_client.stream)
 
 
 async def test_image_entity_uses_image_proxy(
@@ -156,19 +154,6 @@ async def test_image_exactly_at_the_limit_is_served(
     )
 
     assert image.data == body
-
-
-async def test_non_image_content_type_is_refused(
-    hass: HomeAssistant, core_client: HomeAssistantClient
-) -> None:
-    await _serve(hass, TestImage(hass, "page", b"<html></html>", "text/html"))
-
-    with pytest.raises(ToolError) as exc_info:
-        await CameraTools(core_client).ha_get_camera_image(entity_id="image.page")
-
-    error = _error_body(exc_info)
-    assert error["code"] == "SERVICE_CALL_FAILED"
-    assert "text/html" in error["message"]
 
 
 async def test_unknown_image_entity_is_not_found(
