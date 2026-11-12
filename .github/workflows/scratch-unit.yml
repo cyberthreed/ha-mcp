@@ -1,0 +1,12 @@
+name: scratch-unit
+on:
+  push:
+    branches: [scratch/image-entity-core-tests]
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: uv sync --python 3.14 --all-extras --dev
+      - run: uv run pytest tests/src/unit/test_tools_camera_image_entities.py tests/src/unit/test_tools_camera.py tests/src/unit/test_core_reply_rules.py tests/src/unit/test_stand_in_lists_ratchet.py -q
