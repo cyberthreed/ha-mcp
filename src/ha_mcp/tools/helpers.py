@@ -803,12 +803,18 @@ async def get_entity_state_or_none(
 
 
 def ws_failure_code(result: dict[str, Any]) -> ErrorCode:
-    """Map Core's WS error code: ``invalid_format``, ``service_validation_error``
-    and ``not_supported`` (e.g. ``todo/item/move`` on a list without
-    reordering) refuse the caller's input; ``not_found`` is an item Core does
-    not hold (e.g. a YAML-configured helper)."""
+    """Map Core's WS error code: ``invalid_format``, ``invalid_info`` (a
+    registry refusing an update, e.g. a rename into another domain),
+    ``service_validation_error`` and ``not_supported`` (e.g. ``todo/item/move``
+    on a list without reordering) refuse the caller's input; ``not_found`` is an
+    item Core does not hold (e.g. a YAML-configured helper)."""
     code = result.get("error_code")
-    if code in ("invalid_format", "service_validation_error", "not_supported"):
+    if code in (
+        "invalid_format",
+        "invalid_info",
+        "service_validation_error",
+        "not_supported",
+    ):
         return ErrorCode.VALIDATION_INVALID_PARAMETER
     if code == "not_found":
         return ErrorCode.RESOURCE_NOT_FOUND
@@ -840,6 +846,37 @@ def raise_core_refusal(
             context={**(context or {}), "ha_error_code": result.get("error_code")},
         )
     )
+
+
+def raise_entity_refusal(what: str, result: dict[str, Any], entity_id: str) -> NoReturn:
+    """:func:`raise_core_refusal` for a command on one entity; when Core does
+    not know the entity, the caller is also told how to find a valid id."""
+    unknown = result.get("error_code") == "not_found"
+    raise_core_refusal(
+        what,
+        result,
+        {"entity_id": entity_id},
+        ["Use ha_search() to find valid entity IDs"] if unknown else None,
+    )
+
+
+def refuse_blank_name(name: str | None, context: dict[str, Any]) -> None:
+    """Refuse a blank ``name`` of a label or category (``None`` leaves it as is).
+
+    An HA-MCP safeguard: Core stores a blank name, and a blank value clears the
+    other fields, so a blank name is refused instead of read as "clear it".
+    """
+    if name is not None:
+        validate_identifier_not_empty(
+            name,
+            "name",
+            message=(
+                "name must not be blank (an HA-MCP safeguard: Core accepts a "
+                "blank name, and a blank value clears the other fields)"
+            ),
+            suggestions=["Pass a non-empty name, or omit name on update to keep it"],
+            context=context,
+        )
 
 
 def clear_or_keep(value: str | None, param_name: str) -> str | None:

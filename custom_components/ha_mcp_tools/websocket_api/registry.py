@@ -420,25 +420,6 @@ def _enum_value(value: Any) -> Any:
     return getattr(value, "value", str(value))
 
 
-def _timestamp(value: Any) -> float | None:
-    """Serialize a datetime-ish registry timestamp as a float, like core.
-
-    core's registry WS list responses emit ``created_at`` / ``modified_at`` via
-    ``entry.created_at.timestamp()`` (a float, seconds since epoch), so mirror
-    that. A value that is already numeric passes through; anything else (or a
-    ``.timestamp()`` that raises) degrades to ``None``.
-    """
-    if value is None:
-        return None
-    ts = getattr(value, "timestamp", None)
-    if callable(ts):
-        try:
-            return float(ts())
-        except Exception:  # pragma: no cover - defensive  # noqa: BLE001
-            return None
-    return float(value) if isinstance(value, (int, float)) else None
-
-
 def _reg_name(reg: Any) -> str | None:
     """Current display name from a registry entry: user override, else original."""
     if reg is None:
@@ -541,15 +522,17 @@ def _state_get(hass: HomeAssistant, entity_id: str) -> Any:
 
 
 def _state_as_dict(state: Any) -> Any:
-    """core ``State.as_dict()`` verbatim — the REST ``/api/states/<id>`` shape.
+    """Core's ``State.as_dict()``, the REST ``/api/states/<id>`` shape, with the
+    live ``last_reported``.
 
-    Returned unmodified so the WS transport encodes its datetimes with the same
-    ``isoformat`` the REST layer uses (byte-parity — see :func:`_do_states`).
+    Core caches that dict and does not refresh it when a write repeats the
+    unchanged state, so its ``last_reported`` stays at the first serialization
+    (home-assistant/core#181392); the ``State`` object itself is current.
     """
     as_dict = getattr(state, "as_dict", None)
     if callable(as_dict):
         try:
-            return as_dict()
+            return {**as_dict(), "last_reported": state.last_reported.isoformat()}
         except Exception:  # pragma: no cover - defensive  # noqa: BLE001
             return None
     return None
@@ -560,7 +543,7 @@ def _device_dict_repr(entry: Any) -> dict[str, Any] | None:
 
     Returned UNMODIFIED so the WS transport encodes it with the same JSON
     serializer ``config/device_registry/list`` uses (byte-parity — see
-    :func:`_do_device_get`). Guarded against core drift: a missing/raising
+    :func:`do_device_get`). Guarded against core drift: a missing/raising
     ``dict_repr`` yields ``None`` rather than propagating.
     """
     try:

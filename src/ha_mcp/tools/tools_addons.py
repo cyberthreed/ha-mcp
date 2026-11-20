@@ -203,13 +203,12 @@ def _summarize_ws_messages(
 def _apply_response_transform(response: Any, expr: str) -> Any:
     """Run a sandboxed ``python_transform`` expression against ``response``.
 
-    Exposes the value to the expression as ``response``. Supports both
-    in-place mutation and reassignment (``response = [...]``). Raises
-    ToolError with VALIDATION_FAILED on sandbox errors so the agent gets
-    a structured code it can react to.
+    Exposes the value to the expression as ``response``; in-place mutation and
+    reassignment (``response = [...]``) both work. A sandbox error is raised
+    as a ToolError with VALIDATION_FAILED, a code the agent can react to.
     """
     try:
-        return safe_execute_expression(expr, {"response": response}, "response")
+        result = safe_execute_expression(expr, {"response": response}, "response")
     except PythonSandboxError as e:
         message, suggestions = format_sandbox_error(e, expr, variable_name="response")
         raise_tool_error(
@@ -220,6 +219,7 @@ def _apply_response_transform(response: Any, expr: str) -> Any:
                 suggestions=suggestions,
             )
         )
+    return result
 
 
 def _merge_options(base: dict, override: dict) -> dict:
@@ -247,8 +247,8 @@ def _merge_options(base: dict, override: dict) -> dict:
 # that must NOT be retried on this schedule.
 _JOB_COLLISION_MARKER = "another job is running for job group"
 _JOB_COLLISION_RETRY_WINDOW = 60.0
-_JOB_COLLISION_RETRY_INITIAL_DELAY = 1.0
-_JOB_COLLISION_RETRY_MAX_DELAY = 5.0
+JOB_COLLISION_RETRY_INITIAL_DELAY = 1.0
+JOB_COLLISION_RETRY_MAX_DELAY = 5.0
 # Matches Supervisor's canonical app slug grammar. A whole-segment "." or
 # ".." also matches that grammar, but is not a valid identifier here because
 # an HTTP client can normalize it as path traversal.
@@ -701,7 +701,7 @@ async def _supervisor_api_call(
         # the final retry and total elapsed time may extend past that window.
         # Any other failure raises immediately.
         deadline = time.monotonic() + _JOB_COLLISION_RETRY_WINDOW
-        delay = _JOB_COLLISION_RETRY_INITIAL_DELAY
+        delay = JOB_COLLISION_RETRY_INITIAL_DELAY
         attempts = 0
         while True:
             attempts += 1
@@ -772,7 +772,7 @@ async def _supervisor_api_call(
                 error_text,
             )
             await asyncio.sleep(min(delay, remaining))
-            delay = min(delay * 2, _JOB_COLLISION_RETRY_MAX_DELAY)
+            delay = min(delay * 2, JOB_COLLISION_RETRY_MAX_DELAY)
 
     except ToolError:
         raise
@@ -1334,7 +1334,7 @@ def _tls_verification_failure_suggestions() -> list[str]:
     ]
 
 
-def _build_addon_http_client(
+def build_addon_http_client(
     client: HomeAssistantClient, timeout: int, slug: str
 ) -> httpx.AsyncClient:
     """Build the proxy's HTTP client, honoring the HA verify setting.
@@ -2111,7 +2111,7 @@ def _addon_config_for_http_hint(addon: dict[str, Any]) -> dict[str, Any]:
     """Return the app settings that can explain direct-access failures."""
     return {
         "options": addon.get("options"),
-        "ports": addon.get("network") or addon.get("ports") or None,
+        "ports": addon.get("network") or None,
         "host_network": addon.get("host_network"),
         "ingress_port": addon.get("ingress_port"),
     }
@@ -2187,11 +2187,11 @@ def _add_http_error_hints(
                 else:
                     result["suggestion"] = _direct_port_rejection_suggestion()
             else:
-                ports_dict = addon.get("network") or addon.get("ports") or {}
+                ports_dict = addon.get("network") or {}
                 unmapped = sorted(k for k, v in ports_dict.items() if v is None)
-                example_proto = unmapped[0] if unmapped else ""
-                example_port = example_proto.split("/", 1)[0] if example_proto else ""
-                if unmapped and example_port.isdigit():
+                if unmapped:
+                    example_proto = unmapped[0]
+                    example_port = example_proto.split("/", 1)[0]
                     addon_label = addon.get("name") or slug_val
                     result["suggestion"] = (
                         f"Map {example_proto} to a host port in the HA UI "
@@ -2316,7 +2316,7 @@ async def _call_addon_api(
     else:
         request_content = None
 
-    addon_http_client = _build_addon_http_client(client, timeout, slug)
+    addon_http_client = build_addon_http_client(client, timeout, slug)
     try:
         async with addon_http_client as http_client:
             response = await http_client.request(

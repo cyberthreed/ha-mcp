@@ -27,6 +27,7 @@ import yaml  # type: ignore[import-untyped]
 from homeassistant.components import persistent_notification
 from homeassistant.config import async_check_ha_config_file
 from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import SERVICE_RELOAD
 from homeassistant.core import (
     HomeAssistant,
     ServiceCall,
@@ -57,9 +58,7 @@ from .const import (
     RESERVED_DASHBOARD_URL_PATHS,
     TOOLS_ENTRY_LEGACY_TITLE,
     TOOLS_ENTRY_TITLE,
-    YAML_KEY_DEFAULT_POST_ACTION,
     YAML_KEY_DENYLIST,
-    YAML_KEY_POST_ACTIONS,
 )
 from .entry_device import async_register_entry_device
 from .entry_migration import async_migrate_entry as async_migrate_entry
@@ -79,6 +78,7 @@ from .yaml_find import SERVICE_FIND_YAML_KEY, register_find_yaml_key
 from .yaml_rt import (
     apply_seq_indent,
     detect_seq_indent,
+    drop_key,
     make_yaml,
     yaml_dumps,
     yaml_jsonify,
@@ -1920,8 +1920,7 @@ def _apply_lovelace_dashboard_action(
                     f"Dashboard '{url_path}' not found under lovelace.dashboards."
                 ),
             }
-        del dashboards[url_path]
-        # Clean up empty parent containers to keep the file tidy
+        drop_key(dashboards, url_path)
         if not dashboards:
             del lovelace["dashboards"]
         if not lovelace:
@@ -1984,7 +1983,7 @@ def _apply_single_key_edit(
                 "success": False,
                 "error": f"{label} '{yaml_key}' not found in '{rel_path}'.",
             }
-        del data[yaml_key]
+        drop_key(data, yaml_key)
     return None
 
 
@@ -2111,18 +2110,17 @@ def _maybe_build_confirm_preview(
 async def _resolve_post_action(
     hass: HomeAssistant, kind: str, path_parts: tuple[str, ...]
 ) -> dict[str, Any]:
-    """Return the post-edit activation info (restart/reload) for the edit kind."""
-    # Surface the post-edit action required to activate the change
-    post_info: dict[str, Any]
-    if kind == "lovelace_dashboard":
-        post_info = {"post_action": "restart_required"}
-    elif kind == "theme":
-        post_info = await reload_after_edit(hass, "frontend", "reload_themes")
-    else:
-        post_info = YAML_KEY_POST_ACTIONS.get(
-            path_parts[0], YAML_KEY_DEFAULT_POST_ACTION
-        )
-    return post_info
+    """What makes the edit live: a reload Core has for the key, or a restart."""
+    if kind == "theme":
+        return await reload_after_edit(hass, "frontend", "reload_themes")
+    # Core registers ``<domain>.reload`` while the key's integration is loaded.
+    # It registers a YAML dashboard at start-up only, whatever lovelace reloads.
+    if kind != "lovelace_dashboard" and hass.services.has_service(
+        path_parts[0], SERVICE_RELOAD
+    ):
+        reload_service = f"{path_parts[0]}.{SERVICE_RELOAD}"
+        return {"post_action": "reload_available", "reload_service": reload_service}
+    return {"post_action": "restart_required"}
 
 
 async def _apply_yaml_key_edit(

@@ -11,7 +11,7 @@ exists), else ``<data dir>/backups`` where the data dir is what
 ``utils.data_paths.get_data_dir`` resolves (``HA_MCP_CONFIG_DIR``,
 ``~/.ha-mcp``, or the tmpdir fallback). Installs that still hold snapshots
 under the pre-#2372 default ``${XDG_DATA_HOME:-~/.local/share}/ha_mcp/backups``
-keep using that directory; see ``_resolve_default_dir``.
+keep using that directory; see ``resolve_default_dir``.
 
 File format
 -----------
@@ -43,7 +43,6 @@ One handler per backed-up domain. Storage helper types each register one keyed
 from __future__ import annotations
 
 import asyncio
-import functools
 import hashlib
 import logging
 import os
@@ -53,13 +52,13 @@ import threading
 import time
 import weakref
 from collections import Counter
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import asynccontextmanager, nullcontext, suppress
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from functools import cached_property, partial
 from pathlib import Path
-from typing import Any, Literal, NotRequired, TypedDict
+from typing import TYPE_CHECKING, Any, Literal, NotRequired, TypedDict
 
 import yaml  # type: ignore[import-untyped]
 
@@ -83,6 +82,7 @@ from .backup_diff import (
     _build_text_diff_response,
     _compute_json_patch,
     _summarize_patch_counts,
+    json_equal,
 )
 from .backup_entities import (
     current_entity_id,
@@ -104,6 +104,14 @@ from .backup_helper_target import (
 from .backup_helper_target import require_holds as _require_holds
 from .backup_helper_target import safety_target as _safety_target
 from .backup_integrations import fetch_integration, restore_integration
+from .backup_registry_items import COMPARED_ROW_DOMAINS as _COMPARED_ROW_DOMAINS
+from .backup_registry_items import compared_row as _compared_row
+from .backup_registry_items import fetch_area_or_floor as _fetch_area_or_floor
+from .backup_registry_items import fetch_category as _fetch_category
+from .backup_registry_items import fetch_label as _fetch_label
+from .backup_registry_items import restore_area_or_floor as _restore_area_or_floor
+from .backup_registry_items import restore_category as _restore_category
+from .backup_registry_items import restore_label as _restore_label
 from .backup_tags import restore_tag, tag_snapshot
 from .backup_todo import current_key as todo_current_key
 from .backup_todo import fetch_todo_item, restore_todo_item
@@ -115,10 +123,14 @@ from .client.rest_client import (
     HomeAssistantConnectionError,
     HomeAssistantError,
 )
+from .config import get_global_settings
 from .errors import ErrorCode, get_error_code
 from .storage_helper_types import SIMPLE_HELPER_TYPES
 from .utils.data_paths import get_data_dir
 from .utils.registry_update_lock import registry_update_lock
+
+if TYPE_CHECKING:
+    from .server import HomeAssistantSmartMCPServer
 
 logger = logging.getLogger(__name__)
 
@@ -307,8 +319,6 @@ def _flow_failure_reason(step: str, error: BaseException) -> str:
         return "invalid_snapshot"
     if isinstance(error, MandatoryBackupError):
         return "backup_capture_failed"
-    if step == "safety_backup" and isinstance(error, OSError):
-        return "backup_storage_failed"
     return "upstream_error"
 
 
@@ -321,10 +331,6 @@ def _flow_safe_failure_detail(step: str, error: BaseException) -> str | None:
         # HA's structured code, not its message: unknown_command is the
         # ha_mcp_tools component being absent.
         return f"{type(error).__name__} ({error.code})"
-    # The safety stage wraps remote fetch failures in MandatoryBackupError;
-    # a raw OSError here comes from retained-file I/O. Other stages call HA.
-    if step == "safety_backup" and isinstance(error, OSError):
-        return str(error)
     return None
 
 
@@ -351,8 +357,8 @@ _RESTORE_ERRORS: tuple[type[BaseException], ...] = (
 # in once exceeded; protects long-running servers from unbounded growth
 # while staying well above any realistic HA install (typical: dozens to
 # hundreds of entities edited per session).
-_TRACKER_SOFT_CAP = 10_000
-_TRACKER_PRUNE_BATCH = 1_000
+TRACKER_SOFT_CAP = 10_000
+TRACKER_PRUNE_BATCH = 1_000
 
 # Filename pattern: <domain>.<safe_entity_id>.<YYYYMMDD_HHMMSS>[_NN].yaml
 # The middle ``.`` separators make the timestamp rsplit reliable even
@@ -527,7 +533,7 @@ def _holds_files(path: Path) -> bool:
         return False
 
 
-def _resolve_default_dir() -> Path:
+def resolve_default_dir() -> Path:
     """Pick a sane default backup directory for the current deployment mode.
 
     Add-on (Supervisor sets ``SUPERVISOR_TOKEN`` and ``/data`` exists):
@@ -567,21 +573,21 @@ _SNAPSHOT_SKIP: Any = object()
 async def _await_backup_io[T](operation: Callable[..., T], *args: Any) -> T:
     """Keep backup locks/pins until executor I/O settles, even after cancellation."""
     worker = asyncio.create_task(asyncio.to_thread(operation, *args))
-    try:
-        return await asyncio.shield(worker)
-    except asyncio.CancelledError:
-        # Cancelling the await cannot stop its executor thread. Releasing the
-        # caller's lock now would let another capture reserve the same filename.
-        while not worker.done():
-            try:
-                await asyncio.shield(worker)
-            except asyncio.CancelledError:
-                continue  # Repeated cancellation must not release the lock early.
-            except Exception:  # noqa: BLE001
-                break  # Log the worker failure below; preserve cancellation.
-        if not worker.cancelled() and (err := worker.exception()) is not None:
-            logger.warning("Backup I/O failed after cancellation", exc_info=err)
-        raise
+    cancelled: asyncio.CancelledError | None = None
+    # Cancelling the await cannot stop its executor thread, and releasing the
+    # caller's lock early would let another capture reserve the same filename.
+    # asyncio.wait never cancels the worker and, unlike a cancelled shield on
+    # the Python 3.14.4 the unit tests run, leaves nothing for the loop's error handler.
+    while not worker.done():
+        try:
+            await asyncio.wait({worker})
+        except asyncio.CancelledError as err:
+            cancelled = err
+    if cancelled is None:
+        return worker.result()
+    if not worker.cancelled() and (failure := worker.exception()) is not None:
+        logger.warning("Backup I/O failed after cancellation", exc_info=failure)
+    raise cancelled
 
 
 def _require_restore_safety(path: Path) -> None:
@@ -612,7 +618,7 @@ class BackupManager:
         self._client = client
         self._handlers: dict[str, DomainHandler] = {}
         # Throttle tracker: maps "domain:entity_id" -> monotonic-time of
-        # the last successful capture. Auto-pruned past _TRACKER_SOFT_CAP
+        # the last successful capture. Auto-pruned past TRACKER_SOFT_CAP
         # so a long-running server editing many distinct entities cannot
         # leak memory through this dict.
         self._last_snapshot: dict[str, float] = {}
@@ -647,7 +653,7 @@ class BackupManager:
         configured = (getattr(self._settings, "auto_backup_dir", "") or "").strip()
         # A disabled write still needs coordination, but must not create storage.
         # Status checks and captures initialize storage in the backup I/O executor.
-        return Path(configured).expanduser() if configured else _resolve_default_dir()
+        return Path(configured).expanduser() if configured else resolve_default_dir()
 
     @property
     def backup_dir(self) -> Path:
@@ -1062,24 +1068,24 @@ class BackupManager:
     def _maybe_prune_trackers(self) -> None:
         """Cap per-entity tracker growth.
 
-        Once ``_last_snapshot`` exceeds ``_TRACKER_SOFT_CAP``, drop the
-        oldest ``_TRACKER_PRUNE_BATCH`` entries. The lock map is left
+        Once ``_last_snapshot`` exceeds ``TRACKER_SOFT_CAP``, drop the
+        oldest ``TRACKER_PRUNE_BATCH`` entries. The lock map is left
         alone — removing a lock that another task is awaiting would race;
         each lock is small (~64 bytes) and HA installs never reach the
         cap in practice.
         """
-        if len(self._last_snapshot) <= _TRACKER_SOFT_CAP:
+        if len(self._last_snapshot) <= TRACKER_SOFT_CAP:
             return
         # Drop the oldest entries by monotonic timestamp.
         oldest = sorted(self._last_snapshot.items(), key=lambda kv: kv[1])[
-            :_TRACKER_PRUNE_BATCH
+            :TRACKER_PRUNE_BATCH
         ]
         for key, _ in oldest:
             self._last_snapshot.pop(key, None)
         logger.info(
             "Auto-backup: pruned %d oldest tracker entries (cap=%d, now=%d entries)",
             len(oldest),
-            _TRACKER_SOFT_CAP,
+            TRACKER_SOFT_CAP,
             len(self._last_snapshot),
         )
 
@@ -1593,13 +1599,11 @@ class BackupManager:
             # Commit to the absent-target branch: if an entry reappeared since
             # preflight, recreation refuses instead of editing it without safety.
             restore = (
-                functools.partial(_restore_config_subentry, recreate_only=True)
+                partial(_restore_config_subentry, recreate_only=True)
                 if domain == "helper_config_subentry" and safety_path is None
                 else handler.restore
                 if needs_safety
-                else functools.partial(
-                    _recreate_flow_helper, helper_type=_flow_type(domain)
-                )
+                else partial(_recreate_flow_helper, helper_type=_flow_type(domain))
             )
             result = await restore(self._client, entity_id, config)
         except BackupRestoreError as err:
@@ -1696,9 +1700,11 @@ class BackupManager:
         return target
 
     async def snapshot_comparison(self, name: str) -> tuple[dict[str, Any], Any]:
-        """Read a snapshot and the live config for its stable target identity."""
+        """Read a snapshot and the live config for its stable target identity.
+        The envelope carries the comparison's ``warnings``, never the file's."""
         data = await asyncio.to_thread(self.read_snapshot, name)
         _validate_snapshot_envelope(data)
+        data["warnings"] = []
         domain = data["domain"]
         if _is_flow_helper_domain(domain):
             snapshot = _validate_flow_snapshot(
@@ -1719,6 +1725,10 @@ class BackupManager:
             live = await _dashboard_resource_like(self._client, data["config"])
             if live is not None:
                 current = {**live, "id": data["config"].get("id")}
+        elif domain in _COMPARED_ROW_DOMAINS and isinstance(data["config"], dict):
+            current, data["warnings"] = await _compared_row(
+                self._client, domain, data["entity_id"], data["config"], current
+            )
         if (
             isinstance(current, dict)
             and isinstance(data["config"], dict)
@@ -1791,6 +1801,7 @@ class BackupManager:
             patch=patch,
             counts=_summarize_patch_counts(patch),
             truncated=truncated,
+            warnings=data["warnings"],
         )
 
     # ----- legacy store (pre-#1579 .ha_mcp_tools_backups/) ---------------
@@ -1986,6 +1997,15 @@ def get_backup_manager(client: Any, settings: Any) -> BackupManager:
     return mgr
 
 
+def backup_manager_for_server(
+    server: HomeAssistantSmartMCPServer | None,
+) -> BackupManager | None:
+    """Resolve the edit-backup manager shared by settings routes."""
+    settings = get_global_settings()
+    client = getattr(server, "client", None)
+    return get_backup_manager(client, settings) if client is not None else None
+
+
 # --------------------------- domain handlers --------------------------------
 #
 # Fetchers READ the entity's current config; restorers WRITE it back.
@@ -2016,7 +2036,7 @@ async def _rest_post(client: Any, path: str, payload: Any) -> Any:
     return await client._request("POST", path, json=payload)
 
 
-async def _ws_send(client: Any, message: dict[str, Any]) -> Any:
+async def _ws_send(client: Any, message: Mapping[str, Any]) -> Any:
     """Send a WS command using the same lazy-connect pattern as other tools.
 
     Builds a one-shot WS client each call. Latency is acceptable because
@@ -2045,8 +2065,8 @@ async def _ws_send(client: Any, message: dict[str, Any]) -> Any:
         auth = str(get_error_code(error or {})).startswith("AUTH_")
         raise (HomeAssistantAuthError if auth else HomeAssistantConnectionError)(msg)
     try:
-        cmd_type = message.pop("type")
-        envelope = await ws_client.send_command(cmd_type, **message)
+        fields = {key: value for key, value in message.items() if key != "type"}
+        envelope = await ws_client.send_command(message["type"], **fields)
     finally:
         # Best-effort close: narrow to transport/network errors; let
         # other exceptions propagate so they show up in logs rather
@@ -2210,88 +2230,22 @@ async def _restore_dashboard_resource(client: Any, entity_id: str, config: Any) 
     return await _ws_send(client, {"type": "lovelace/resources/create", **payload})
 
 
-# Labels — config/label_registry/{list,update}
+# Registry read-only fields
 #
-# Registry ``/update`` commands refuse the ``created_at``/``modified_at`` their
-# lists return, which snapshots keep; every registry restore strips them.
+# Registry ``/update`` and ``/create`` commands refuse the ``created_at`` and
+# ``modified_at`` their lists return, which snapshots keep. The registry item
+# restores and diffs use this list when the component gives no answer; the
+# other restores apply it without asking.
 _REGISTRY_READONLY_KEYS = frozenset({"created_at", "modified_at"})
 
 
 def _strip_readonly(config: dict[str, Any], *extra: str) -> dict[str, Any]:
     """Return ``config`` with read-only registry fields removed.
 
-    ``extra`` names per-registry id keys (``label_id``, ...) the update command
-    takes separately and refuses inside the payload body.
+    ``extra`` names further keys to remove, such as the row's ``id``.
     """
     drop = _REGISTRY_READONLY_KEYS | set(extra)
     return {k: v for k, v in config.items() if k not in drop}
-
-
-async def _fetch_label(client: Any, entity_id: str) -> Any:
-    # Route the capture through the component's ``registries`` capability when
-    # available (one in-process read of the label registry) instead of dumping
-    # the whole registry via WS. Lazy import to avoid the backup_manager →
-    # tools → backup_manager cycle (same pattern as ``_fetch_device``). ``None``
-    # from the helper means "component unavailable"; fall back to the full list.
-    from .tools.component_registries import fetch_registries_via_component
-
-    component_result = await fetch_registries_via_component(client, ["label"])
-    if component_result is not None:
-        items = component_result.get("labels") or []
-    else:
-        items = _require_list(
-            await _ws_send(client, {"type": "config/label_registry/list"}),
-            "config/label_registry/list",
-        )
-    for item in items:
-        if item.get("label_id") == entity_id:
-            return item
-    return None
-
-
-async def _restore_label(client: Any, entity_id: str, config: Any) -> Any:
-    payload = _strip_readonly(config, "label_id")
-    payload["type"] = "config/label_registry/update"
-    payload["label_id"] = entity_id
-    return await _ws_send(client, payload)
-
-
-# Categories — config/category_registry/{list,update}
-
-
-async def _fetch_category(client: Any, entity_id: str) -> Any:
-    scope, _, cat_id = entity_id.partition(":")
-    if not cat_id:
-        return None
-    # Same component-first routing as ``_fetch_label``; categories are scoped,
-    # so the requested scope rides ``category_scopes``.
-    from .tools.component_registries import fetch_registries_via_component
-
-    component_result = await fetch_registries_via_component(
-        client, ["category"], category_scopes=[scope]
-    )
-    if component_result is not None:
-        items = (component_result.get("categories") or {}).get(scope, [])
-    else:
-        items = _require_list(
-            await _ws_send(
-                client, {"type": "config/category_registry/list", "scope": scope}
-            ),
-            "config/category_registry/list",
-        )
-    for item in items:
-        if item.get("category_id") == cat_id:
-            return {"scope": scope, **item}
-    return None
-
-
-async def _restore_category(client: Any, entity_id: str, config: Any) -> Any:
-    scope, _, cat_id = entity_id.partition(":")
-    payload = _strip_readonly(config, "category_id", "scope")
-    payload["type"] = "config/category_registry/update"
-    payload["scope"] = scope or config.get("scope")
-    payload["category_id"] = cat_id
-    return await _ws_send(client, payload)
 
 
 # Groups — group.set service. Fetch via state API.
@@ -2321,58 +2275,6 @@ async def _restore_group(client: Any, entity_id: str, config: Any) -> Any:
         service_data["entities"] = config["entities"]
     group_set = {"type": "call_service", "domain": "group", "service": "set"}
     return await _ws_send(client, {**group_set, "service_data": service_data})
-
-
-# Areas / floors — config/area_registry/{list,update}, config/floor_registry/{list,update}
-
-
-async def _fetch_area_or_floor(client: Any, entity_id: str) -> Any:
-    kind, _, real_id = entity_id.partition(":")
-    if not real_id:
-        return None
-    # Same component-first routing as ``_fetch_label`` / ``_fetch_category``.
-    from .tools.component_registries import fetch_registries_via_component
-
-    if kind == "area":
-        component_result = await fetch_registries_via_component(client, ["area"])
-        if component_result is not None:
-            items = component_result.get("areas") or []
-        else:
-            items = _require_list(
-                await _ws_send(client, {"type": "config/area_registry/list"}),
-                "config/area_registry/list",
-            )
-        for item in items:
-            if item.get("area_id") == real_id:
-                return {"kind": "area", **item}
-    elif kind == "floor":
-        component_result = await fetch_registries_via_component(client, ["floor"])
-        if component_result is not None:
-            items = component_result.get("floors") or []
-        else:
-            items = _require_list(
-                await _ws_send(client, {"type": "config/floor_registry/list"}),
-                "config/floor_registry/list",
-            )
-        for item in items:
-            if item.get("floor_id") == real_id:
-                return {"kind": "floor", **item}
-    return None
-
-
-async def _restore_area_or_floor(client: Any, entity_id: str, config: Any) -> Any:
-    kind, _, real_id = entity_id.partition(":")
-    payload = _strip_readonly(config, "kind", "area_id", "floor_id")
-    if kind == "area":
-        payload["type"] = "config/area_registry/update"
-        payload["area_id"] = real_id
-    elif kind == "floor":
-        payload["type"] = "config/floor_registry/update"
-        payload["floor_id"] = real_id
-    else:
-        raise ValueError(f"Unknown area/floor kind: {kind!r}")
-    async with registry_update_lock(kind, real_id):
-        return await _ws_send(client, payload)
 
 
 # Devices — config/device_registry/{list,update}. ``ha_set_device`` mutates
@@ -2510,12 +2412,6 @@ async def _fetch_yaml(client: Any, entity_id: str) -> Any:
             return None
         raise HomeAssistantError(f"read_file failed for {file!r}: {error}")
     # The component extracts the subtree (it has ruamel); None = key absent.
-    # ``yaml_path`` is a backward-compatible read_file enhancement, so it is
-    # NOT gated by MIN_COMPONENT_VERSION: a component too old to support it
-    # returns no ``subtree`` (or rejects the key), and capture degrades to a
-    # logged skip — the yaml edit still works, it just isn't snapshotted. The
-    # add-on always ships the matching component, so this only affects a
-    # mismatched standalone install.
     return result.get("subtree")
 
 
@@ -2535,10 +2431,7 @@ async def _restore_yaml(client: Any, entity_id: str, config: Any) -> Any:
     from .config import get_global_settings
     from .tools.tools_filesystem import call_mcp_tools_service
     from .tools.util_helpers import unwrap_service_response
-    from .tools.yaml_extra_keys import (
-        assert_extra_yaml_keys_supported,
-        effective_extra_yaml_write_keys,
-    )
+    from .tools.yaml_extra_keys import effective_extra_yaml_write_keys
 
     # Split on the LAST "::" (see _fetch_yaml) so an exotic file path
     # containing "::" still restores to the right file and key.
@@ -2553,10 +2446,6 @@ async def _restore_yaml(client: Any, entity_id: str, config: Any) -> Any:
     }
     extra_keys = await effective_extra_yaml_write_keys(client, get_global_settings())
     if extra_keys:
-        # Same version gate as the write path: without it a component that
-        # predates the field rejects the whole restore call over an option
-        # the snapshot being restored may not even use.
-        await assert_extra_yaml_keys_supported(client, extra_keys)
         service_data["extra_allowed_keys"] = extra_keys
     result = await call_mcp_tools_service(
         client,
@@ -2712,16 +2601,6 @@ async def _restore_blueprint(client: Any, path: str, config: Any, domain: str) -
         error = response.get("error") if isinstance(response, dict) else response
         raise HomeAssistantError(f"blueprint/save restore failed for {path!r}: {error}")
     return response.get("result") or {}
-
-
-def _make_blueprint_handler(domain: str) -> DomainHandler:
-    async def fetch(client: Any, entity_id: str) -> Any:
-        return await _fetch_blueprint(client, entity_id, domain)
-
-    async def restore(client: Any, entity_id: str, config: Any) -> Any:
-        return await _restore_blueprint(client, entity_id, config, domain)
-
-    return DomainHandler(domain=f"blueprint_{domain}", fetch=fetch, restore=restore)
 
 
 def _flow_type(domain: str) -> str:
@@ -2896,13 +2775,6 @@ def _flow_snapshot_for_restore(
         raise BackupRestoreError(str(err), reason="invalid_snapshot") from err
 
 
-def _snapshot_configs_match(expected: Any, current: Any) -> bool:
-    """Reuse the preview's type-sensitive comparison (False is not 0)."""
-    patch: list[dict[str, Any]] = []
-    _compute_json_patch(expected, current, 1, patch)
-    return not patch
-
-
 async def _verify_readback(
     read: Callable[[], Awaitable[Any]], expected: Any, keys: tuple[str, ...]
 ) -> Literal["matched", "mismatched", "unavailable"]:
@@ -2914,7 +2786,7 @@ async def _verify_readback(
         _log_flow_helper_failure("readback", err)
         return "unavailable"
     actual = {key: restored[key] for key in keys} if restored is not None else None
-    if _snapshot_configs_match(expected, actual):
+    if json_equal(expected, actual):
         return "matched"
     logger.warning("Flow helper restore step=readback reason=mismatch")
     return "mismatched"
@@ -3477,23 +3349,11 @@ async def _recreate_config_subentry(
 
 
 def _make_flow_helper_handler(helper_type: str) -> DomainHandler:
-    async def fetch(client: Any, entity_id: str) -> Any:
-        return await _fetch_flow_helper(client, entity_id, helper_type)
-
-    async def restore(client: Any, entity_id: str, config: Any) -> Any:
-        return await _restore_flow_helper(client, entity_id, config, helper_type)
-
-    return DomainHandler(domain=f"helper_{helper_type}", fetch=fetch, restore=restore)
-
-
-def _make_helper_handler(helper_type: str) -> DomainHandler:
-    async def fetch(client: Any, entity_id: str) -> Any:
-        return await _fetch_helper(client, entity_id, helper_type)
-
-    async def restore(client: Any, entity_id: str, config: Any) -> Any:
-        return await _restore_helper(client, entity_id, config, helper_type)
-
-    return DomainHandler(domain=f"helper_{helper_type}", fetch=fetch, restore=restore)
+    return DomainHandler(
+        f"helper_{helper_type}",
+        partial(_fetch_flow_helper, helper_type=helper_type),
+        partial(_restore_flow_helper, helper_type=helper_type),
+    )
 
 
 # --------------------------- registry assembly ------------------------------
@@ -3520,7 +3380,7 @@ def register_default_handlers(mgr: BackupManager, _client: Any) -> None:
     mgr.register(
         DomainHandler("calendar_event", _fetch_calendar_event, _restore_calendar_event)
     )
-    restore_zone_item = functools.partial(_restore_helper, helper_type="zone")
+    restore_zone_item = partial(_restore_helper, helper_type="zone")
     mgr.register(DomainHandler("zone", fetch_zone, restore_zone_item))
     mgr.register(
         DomainHandler("area_or_floor", _fetch_area_or_floor, _restore_area_or_floor)
@@ -3538,9 +3398,21 @@ def register_default_handlers(mgr: BackupManager, _client: Any) -> None:
     # Blueprint files (#2329): the pre-write snapshot for
     # ha_manage_blueprints(action="delete" / "save").
     for blueprint_domain in ("automation", "script"):
-        mgr.register(_make_blueprint_handler(blueprint_domain))
+        mgr.register(
+            DomainHandler(
+                f"blueprint_{blueprint_domain}",
+                partial(_fetch_blueprint, domain=blueprint_domain),
+                partial(_restore_blueprint, domain=blueprint_domain),
+            )
+        )
     for helper_type in _KNOWN_HELPER_TYPES:
-        mgr.register(_make_helper_handler(helper_type))
+        mgr.register(
+            DomainHandler(
+                f"helper_{helper_type}",
+                partial(_fetch_helper, helper_type=helper_type),
+                partial(_restore_helper, helper_type=helper_type),
+            )
+        )
     mgr.register(
         DomainHandler(
             "helper_config_subentry", _fetch_config_subentry, _restore_config_subentry

@@ -23,20 +23,20 @@ from ._config import (
     INDIVIDUAL_FETCH_BATCH_SIZE,
     SCRIPT_CONFIG_TIME_BUDGET,
 )
-from ._fetch import (
+from ._flow_helpers import FlowHelperSearchMixin
+from ._scenes import SceneSearchMixin
+from .fetch import (
     http_500_diagnosis_hint,
     is_timeout_error,
     record_first_failure,
 )
-from ._flow_helpers import FlowHelperSearchMixin
-from ._graph import (
+from .graph import (
     GraphResult,
     _graph_applies,
     _graph_partial_reasons,
     _merge_graph_hits,
     fetch_related_buckets,
 )
-from ._scenes import SceneSearchMixin
 
 logger = logging.getLogger(__name__)
 
@@ -350,7 +350,7 @@ class DeepSearchMixin(SceneSearchMixin, FlowHelperSearchMixin):
                 (
                     results["dashboards"],
                     dashboard_failed,
-                ) = await self._search_dashboards_surface(
+                ) = await self.search_dashboards_surface(
                     query_lower,
                     exact_match,
                     semaphore,
@@ -518,7 +518,7 @@ class DeepSearchMixin(SceneSearchMixin, FlowHelperSearchMixin):
             try:
                 config = await asyncio.wait_for(
                     self.client._request("GET", f"/config/automation/config/{uid}"),
-                    timeout=INDIVIDUAL_CONFIG_TIMEOUT,
+                    timeout=self.config_timeout,
                 )
                 return (uid, config, None)
             except HomeAssistantAPIError as e:
@@ -543,7 +543,7 @@ class DeepSearchMixin(SceneSearchMixin, FlowHelperSearchMixin):
                 # timeout while still perfectly healthy (#1784).
                 logger.debug(
                     f"Automation individual config fetch ({uid}) timed "
-                    f"out after {INDIVIDUAL_CONFIG_TIMEOUT}s."
+                    f"out after {self.config_timeout}s."
                 )
                 return (uid, None, "timeout")
             except Exception as e:  # noqa: BLE001
@@ -661,7 +661,7 @@ class DeepSearchMixin(SceneSearchMixin, FlowHelperSearchMixin):
             try:
                 config_resp = await asyncio.wait_for(
                     self.client.get_script_config(sid),
-                    timeout=INDIVIDUAL_CONFIG_TIMEOUT,
+                    timeout=self.config_timeout,
                 )
                 return (sid, config_resp.get("config", {}), None)
             except HomeAssistantAPIError as e:
@@ -683,7 +683,7 @@ class DeepSearchMixin(SceneSearchMixin, FlowHelperSearchMixin):
                 # batch concurrency, distinct from a real failure (#1784).
                 logger.debug(
                     f"Script individual config fetch ({sid}) timed out "
-                    f"after {INDIVIDUAL_CONFIG_TIMEOUT}s."
+                    f"after {self.config_timeout}s."
                 )
                 return (sid, None, "timeout")
             except Exception as e:  # noqa: BLE001
@@ -787,7 +787,7 @@ class DeepSearchMixin(SceneSearchMixin, FlowHelperSearchMixin):
             out[uid] = (entity_id, current_name)
         return out
 
-    async def _search_helper_type(
+    async def search_helper_type(
         self,
         helper_type: str,
         query_lower: str,
@@ -941,7 +941,7 @@ class DeepSearchMixin(SceneSearchMixin, FlowHelperSearchMixin):
         failed_type_count = 0
         type_results = await asyncio.gather(
             *[
-                self._search_helper_type(
+                self.search_helper_type(
                     ht,
                     query_lower,
                     exact_match,
@@ -981,7 +981,7 @@ class DeepSearchMixin(SceneSearchMixin, FlowHelperSearchMixin):
         failed_type_count += flow_failed_count
         return results, failed_type_count, unsearched
 
-    async def _search_dashboards_surface(
+    async def search_dashboards_surface(
         self,
         query_lower: str,
         exact_match: bool,
@@ -1083,7 +1083,7 @@ class DeepSearchMixin(SceneSearchMixin, FlowHelperSearchMixin):
             }
         return list(records.values()), failed
 
-    async def _search_one_dashboard(
+    async def search_one_dashboard(
         self,
         url_path: str,
         title: str,
@@ -1116,7 +1116,7 @@ class DeepSearchMixin(SceneSearchMixin, FlowHelperSearchMixin):
                     get_data["url_path"] = url_path
                 resp = await asyncio.wait_for(
                     self.client.send_websocket_message(get_data),
-                    timeout=INDIVIDUAL_CONFIG_TIMEOUT,
+                    timeout=self.config_timeout,
                 )
                 # A soft failure does NOT raise: send_websocket_message returns
                 # {"success": False, "error": ...} on a 403-after-retries or a
@@ -1202,7 +1202,7 @@ class DeepSearchMixin(SceneSearchMixin, FlowHelperSearchMixin):
 
             dash_results = await asyncio.gather(
                 *[
-                    self._search_one_dashboard(
+                    self.search_one_dashboard(
                         url_path, title, query_lower, exact_match, semaphore
                     )
                     for url_path, title in dashboards_to_search
