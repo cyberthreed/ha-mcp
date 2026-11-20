@@ -1,8 +1,8 @@
 """
-Camera tools for Home Assistant MCP server.
+Camera and image entity tools for Home Assistant MCP server.
 
-This module provides camera-related tools including snapshot retrieval
-that returns images directly to the LLM for visual analysis, alongside a
+This module retrieves camera snapshots and image entity content
+directly for visual analysis, alongside a
 short text block stating the served snapshot's size and retrieval time.
 """
 
@@ -75,11 +75,11 @@ def _snapshot_info_text(
     timezone_fallback: bool = False,
     label: str = "Camera snapshot",
 ) -> str:
-    """Build the text half of the camera image response.
+    """Build the text half of a camera or image entity response.
 
     Reports the size of the image actually served (which may differ from
     the camera's native resolution when Home Assistant rescaled it) and
-    when the snapshot was retrieved, in Home Assistant local time with
+    when the image was retrieved, in Home Assistant local time with
     UTC offset. When the timezone lookup fell back to UTC, the text says
     so, so the label cannot be mistaken for a genuine UTC install.
 
@@ -87,7 +87,7 @@ def _snapshot_info_text(
     never the entity's name or state. Home Assistant can mark an entity
     ``llm_exposure: hidden``, asking the LLM to know nothing about that
     entity; that setting does not un-expose this tool, so entity data in
-    the text would keep reporting on the camera despite the setting.
+    the text would keep reporting on the entity despite the setting.
     """
     prefix = f"{label} ({image_format.upper()}"
     if image_size is None:
@@ -104,7 +104,7 @@ def _snapshot_info_text(
 
 
 class CameraTools:
-    """Camera snapshot retrieval tools."""
+    """Camera snapshot and image entity retrieval tools."""
 
     def __init__(self, client: Any) -> None:
         self._client = client
@@ -131,32 +131,25 @@ class CameraTools:
                 )
             )
         if response.status_code >= 400:
+            image_label = "camera image" if noun == "camera" else "image"
+            entity_label = "camera" if noun == "camera" else "image entity"
+            unavailable = (
+                f". The {entity_label} may be offline or temporarily unavailable"
+                if response.status_code >= 500
+                else ""
+            )
             raise_tool_error(
                 create_error_response(
                     ErrorCode.SERVICE_CALL_FAILED,
-                    f"Failed to retrieve {noun} image: HTTP {response.status_code}",
+                    f"Failed to retrieve {image_label}: "
+                    f"HTTP {response.status_code}{unavailable}",
+                    suggestions=[
+                        f"Check that the {entity_label} has an image in Home Assistant",
+                        "Check the entity's integration and its source connection",
+                    ],
                     context={"entity_id": entity_id},
                 )
             )
-
-    @staticmethod
-    def _raise_empty(entity_id: str, noun: str = "camera") -> NoReturn:
-        """Raise when HA answered successfully but had no image to serve."""
-        raise_tool_error(
-            create_error_response(
-                ErrorCode.SERVICE_CALL_FAILED,
-                f"{noun.capitalize()} {entity_id} returned empty image data. "
-                f"The {noun} may be offline or temporarily unavailable.",
-                context={"entity_id": entity_id},
-            )
-        )
-
-    @classmethod
-    def _check_response(cls, response: Any, entity_id: str) -> None:
-        """Validate a camera-proxy HTTP response, raising a structured ToolError."""
-        cls._check_status(response, entity_id)
-        if not response.content:
-            cls._raise_empty(entity_id)
 
     async def _fetch_image_entity(self, entity_id: str) -> tuple[bytes, str]:
         """Fetch an image entity's bytes through HA's image proxy, size-bounded.
@@ -171,17 +164,6 @@ class CameraTools:
             self._check_status(response, entity_id, "image")
 
             content_type = response.headers.get("content-type", "")
-            media_type = content_type.split(";", 1)[0].strip().lower()
-            if not media_type.startswith("image/"):
-                raise_tool_error(
-                    create_error_response(
-                        ErrorCode.SERVICE_CALL_FAILED,
-                        f"Image entity {entity_id} did not return an image "
-                        f"(content type: {media_type or 'missing'}).",
-                        context={"entity_id": entity_id},
-                    )
-                )
-
             declared = _declared_content_length(response)
             if declared is not None and declared > limit:
                 self._raise_too_large(entity_id, limit, declared)
@@ -189,8 +171,6 @@ class CameraTools:
             if exceeded:
                 self._raise_too_large(entity_id, limit, None)
 
-        if not body:
-            self._raise_empty(entity_id, "image")
         return body, content_type
 
     @staticmethod
@@ -200,6 +180,11 @@ class CameraTools:
                 ErrorCode.IMAGE_PAYLOAD_TOO_LARGE,
                 f"Image entity {entity_id} exceeds the server's safe "
                 f"inline-image limit of {limit} bytes.",
+                suggestions=[
+                    "Home Assistant's image proxy cannot resize images, so retrying "
+                    "the same entity will not help. Reduce the image at its source "
+                    "or choose an entity with a smaller image."
+                ],
                 context={
                     "entity_id": entity_id,
                     "limit_bytes": limit,
@@ -272,7 +257,8 @@ class CameraTools:
         width: Annotated[
             int | None,
             Field(
-                description="Width for the resized image (camera entities only). Home Assistant "
+                description="Width for the resized image (camera entities only, "
+                "rejected for image entities). Home Assistant "
                 "rescales only when both width and height are given and "
                 "the camera serves JPEG."
             ),
@@ -280,7 +266,8 @@ class CameraTools:
         height: Annotated[
             int | None,
             Field(
-                description="Height for the resized image (camera entities only). Home Assistant "
+                description="Height for the resized image (camera entities only, "
+                "rejected for image entities). Home Assistant "
                 "rescales only when both width and height are given and "
                 "the camera serves JPEG."
             ),
@@ -288,27 +275,22 @@ class CameraTools:
     ) -> tuple[str, Image]:
         """Get a snapshot image from a Home Assistant camera or image entity.
 
-        Fetches the current image and returns it directly for
-        visual analysis (security checks, delivery verification,
-        confirming a garage door actually closed), in the format Home
-        Assistant serves (JPEG, PNG, or GIF), alongside a short text
-        block stating the served snapshot's size and retrieval time in
-        Home Assistant local time.
-
-        Do not use it to inspect the camera's state or attributes — use
-        ha_search or ha_get_state for those; it returns an image, not
-        state. Use it when you need to see the current scene, and on
-        high-resolution cameras pass width and height to reduce token
-        usage.
+        Returns the image in the format Home Assistant serves, alongside
+        its dimensions when available and retrieval time in Home Assistant
+        local time. Use ha_search or ha_get_state for entity state and
+        attributes. Use this tool for visual analysis of a camera scene,
+        album art, a chart, or other image entity content. On high-resolution
+        cameras pass width and height to reduce token usage.
 
         EXAMPLE: ha_get_camera_image(entity_id="camera.backyard", width=640, height=480)
+        EXAMPLE: ha_get_camera_image(entity_id="image.album_art")
         """
         if not entity_id or "." not in entity_id:
             raise_tool_error(
                 create_error_response(
                     ErrorCode.VALIDATION_INVALID_PARAMETER,
                     f"Invalid entity_id format: {entity_id}. "
-                    "Expected format: camera.entity_name",
+                    "Expected format: camera.entity_name or image.entity_name",
                 )
             )
 
@@ -328,7 +310,7 @@ class CameraTools:
 
         # Build the camera proxy URL with optional size parameters
         # Home Assistant camera proxy API: /api/camera_proxy/<entity_id>
-        endpoint = f"/camera_proxy/{entity_id}"
+        endpoint = f"/camera_proxy/{quote(entity_id, safe='')}"
 
         params = {}
         if width is not None:
@@ -340,7 +322,7 @@ class CameraTools:
             response = await self._client.httpx_client.get(
                 endpoint, params=params or None
             )
-            self._check_response(response, entity_id)
+            self._check_status(response, entity_id)
             # Sample the clock the moment HA handed us the bytes; the zone
             # is resolved separately so a slow timezone lookup only delays
             # the label, never the timestamp.
@@ -392,5 +374,5 @@ class CameraTools:
 
 
 def register_camera_tools(mcp: Any, client: Any, **kwargs: Any) -> None:
-    """Register Home Assistant camera tools."""
+    """Register Home Assistant camera and image entity tools."""
     register_tool_methods(mcp, CameraTools(client))

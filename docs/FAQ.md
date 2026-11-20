@@ -990,13 +990,13 @@ code execution via `ha_manage_custom_tool` (`code` / `run_saved` — pure
 (`ha_get_dashboard_screenshot`, `ha_config_get_dashboard` with
 `include_screenshot`, or `ha_config_set_dashboard` with `return_screenshot`).
 
-One image surface is deliberately **exempt**: `ha_get_camera_image`. A camera
-the filter does not hide returns physical-world imagery — a photograph, not a
-rendering of Home Assistant entity data — so its frames are not gated (a hidden
-camera is concealed like any other entity). The residual case is a visible
-camera whose view happens to include a display showing a hidden entity's state;
-if a camera can see something sensitive, hide the camera too (denylist or its
-area).
+One image surface is deliberately **exempt** from pixel scanning:
+`ha_get_camera_image`. A visible camera or image entity remains readable, while
+a hidden camera or image entity is concealed like any other entity. A camera
+can show a display with a hidden entity's state. An image entity can render
+other entities' data directly, including template images, charts and maps.
+Hide the camera or image entity too (denylist or its area) when its pixels
+expose sensitive data, even if the source entity is already hidden.
 
 `ha_get_skill_guide` and `ha_search_tools` are always **exempt**: they return
 bundled docs and tool schemas, never Home Assistant data, and their examples can

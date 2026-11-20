@@ -11,7 +11,7 @@ import re
 import zoneinfo
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from homeassistant.components.camera import DOMAIN as CAMERA_DOMAIN
@@ -118,6 +118,27 @@ async def test_non_camera_entity_is_refused_naming_its_domain(
     assert error["code"] == "VALIDATION_INVALID_PARAMETER"
     assert "not a camera or image entity" in error["message"]
     assert "Domain is 'sensor', expected 'camera' or 'image'" in error["message"]
+
+
+async def test_camera_entity_id_cannot_read_another_api_endpoint(
+    hass: HomeAssistant, core_client: HomeAssistantClient
+) -> None:
+    await serve(hass, JPEG_MAGIC)
+
+    with (
+        patch.object(
+            core_client.httpx_client, "get", wraps=core_client.httpx_client.get
+        ) as request,
+        pytest.raises(ToolError) as exc_info,
+    ):
+        await CameraTools(core_client).ha_get_camera_image(
+            entity_id="camera.x/../../config"
+        )
+
+    assert error_of(exc_info)["code"] == "ENTITY_NOT_FOUND"
+    endpoint = request.call_args.args[0]
+    assert endpoint.startswith("/camera_proxy/camera.x%2F")
+    assert "/../" not in endpoint
 
 
 async def test_snapshot_comes_back_as_image_with_format_and_retrieval_time(
@@ -311,6 +332,8 @@ async def test_camera_without_an_image_is_reported_as_a_failed_call(
     assert error["code"] == "SERVICE_CALL_FAILED"
     assert "HTTP 500" in error["message"]
     assert "may be offline" in error["message"]
+    assert "camera" in error["suggestion"].lower()
+    assert "service" not in " ".join(error["suggestions"]).lower()
 
 
 async def test_unreachable_home_assistant_is_reported_as_a_connection_failure(

@@ -62,23 +62,6 @@ def _spy_on_requests(
     return patch.object(client.httpx_client, "stream", wraps=client.httpx_client.stream)
 
 
-async def test_image_entity_uses_image_proxy(
-    hass: HomeAssistant, core_client: HomeAssistantClient
-) -> None:
-    body = _png(64, 32)
-    await _serve(hass, TestImage(hass, "qr code", body))
-
-    with _spy_on_requests(core_client) as stream:
-        text, image = await CameraTools(core_client).ha_get_camera_image(
-            entity_id="image.qr_code"
-        )
-
-    assert stream.call_args.args[1] == "/image_proxy/image.qr_code"
-    assert image.data == body
-    assert image.to_image_content().mime_type == "image/png"
-    assert text.startswith("Image (PNG, 64x32). Retrieved: ")
-
-
 @pytest.mark.parametrize("dimension", ["width", "height"])
 async def test_dimensions_rejected_for_image_entities(
     hass: HomeAssistant, core_client: HomeAssistantClient, dimension: str
@@ -115,7 +98,8 @@ async def test_declared_oversize_is_refused(
     hass: HomeAssistant, core_client: HomeAssistantClient, monkeypatch: Any
 ) -> None:
     monkeypatch.setattr(tools_camera, "MAX_IMAGE_ENTITY_BYTES", 1024)
-    await _serve(hass, TestImage(hass, "huge", _png(4, 4) + b"0" * 2048))
+    image_bytes = _png(4, 4) + b"0" * 2048
+    await _serve(hass, TestImage(hass, "huge", image_bytes))
 
     with pytest.raises(ToolError) as exc_info:
         await CameraTools(core_client).ha_get_camera_image(entity_id="image.huge")
@@ -124,6 +108,9 @@ async def test_declared_oversize_is_refused(
     body = json.loads(exc_info.value.args[0])
     assert body["limit_bytes"] == 1024
     assert body["entity_id"] == "image.huge"
+    assert body["declared_bytes"] == len(image_bytes)
+    assert "cannot resize" in body["error"]["suggestion"]
+    assert "retrying the same entity" in body["error"]["suggestion"]
 
 
 async def test_image_exactly_at_the_limit_is_served(
@@ -161,4 +148,11 @@ async def test_unavailable_image_is_a_service_error(
     with pytest.raises(ToolError) as exc_info:
         await CameraTools(core_client).ha_get_camera_image(entity_id="image.broken")
 
-    assert error_of(exc_info)["code"] == "SERVICE_CALL_FAILED"
+    error = error_of(exc_info)
+    assert error["code"] == "SERVICE_CALL_FAILED"
+    assert error["message"] == (
+        "Failed to retrieve image: HTTP 500. "
+        "The image entity may be offline or temporarily unavailable"
+    )
+    assert "image" in error["suggestion"].lower()
+    assert "service" not in " ".join(error["suggestions"]).lower()

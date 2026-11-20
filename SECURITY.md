@@ -191,10 +191,12 @@ hidden entity's state without naming its entity_id cannot be caught. On enforced
 scannable paths, a matching hidden entity's data is not returned. Existence
 concealment is best-effort: per-tool not-found shapes vary, so a prober comparing
 errors may infer that an id is hidden rather than absent. The boundary covers
-Home Assistant entity data, not physical-world imagery: a visible camera or
-image entity stays readable (`ha_get_camera_image`) and could incidentally show a
-display that renders a hidden entity's state — hide that camera or image entity
-when its view is sensitive.
+Home Assistant entity data. Pixel output from a visible camera or image entity
+stays readable through `ha_get_camera_image`. Cameras can show a display with
+a hidden entity's state, and image entities can render other entities' data
+directly, including template images, charts and maps. Hide the camera or image
+entity when its pixels expose sensitive data, even if the source entity is
+already hidden.
 Enforce mode is not a defense against an adversarial prompt author deliberately
 trying to exfiltrate a hidden entity's state, nor a substitute for Home
 Assistant's permission model; restrict what the configured token can reach in
