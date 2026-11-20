@@ -1,0 +1,123 @@
+name: Camera review validation
+
+on:
+  push:
+    branches: [scratch/image-entity-review-20261119]
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    container:
+      image: ghcr.io/astral-sh/uv:0.13.9-python3.14-trixie-slim
+    steps:
+      - run: apt-get update -qq && apt-get install -y -qq git jq g++ >/dev/null
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+          submodules: true
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
+        with:
+          node-version: '24'
+      - run: uv sync --all-extras --dev
+      - run: cd tests/js && corepack npm ci
+      - name: Confirm the regressions fail before the fix
+        shell: bash
+        run: |
+          cp src/ha_mcp/tools/tools_camera.py /tmp/fixed-camera.py
+          trap 'cp /tmp/fixed-camera.py src/ha_mcp/tools/tools_camera.py' EXIT
+          git show 57bbfac27984bc93d67d941ced5647764f8b7bc5:src/ha_mcp/tools/tools_camera.py > src/ha_mcp/tools/tools_camera.py
+          set +e
+          uv run pytest tests/src/unit/test_tools_camera.py tests/src/unit/test_tools_camera_image_entities.py -k 'camera_entity_id_cannot_read_another_api_endpoint or unavailable_image_is_a_service_error' --junitxml=/tmp/regressions.xml -q
+          status=$?
+          set -e
+          test "$status" -eq 1
+          uv run python - <<'PY'
+          import xml.etree.ElementTree as ET
+          cases = ET.parse('/tmp/regressions.xml').findall('.//testcase')
+          assert len(cases) == 2
+          assert all(case.find('failure') is not None for case in cases)
+          assert all(case.find('error') is None for case in cases)
+          PY
+      - name: Confirm the size test detects removal of the declared-length check
+        shell: bash
+        run: |
+          cp src/ha_mcp/tools/tools_camera.py /tmp/fixed-camera.py
+          trap 'cp /tmp/fixed-camera.py src/ha_mcp/tools/tools_camera.py' EXIT
+          uv run python - <<'PY'
+          from pathlib import Path
+          path = Path('src/ha_mcp/tools/tools_camera.py')
+          source = path.read_text()
+          check = '            if declared is not None and declared > limit:\n                self._raise_too_large(entity_id, limit, declared)\n'
+          assert check in source
+          path.write_text(source.replace(check, ''))
+          PY
+          set +e
+          uv run pytest tests/src/unit/test_tools_camera_image_entities.py -k declared_oversize_is_refused --junitxml=/tmp/size-regression.xml -q
+          status=$?
+          set -e
+          test "$status" -eq 1
+          uv run python - <<'PY'
+          import xml.etree.ElementTree as ET
+          cases = ET.parse('/tmp/size-regression.xml').findall('.//testcase')
+          assert len(cases) == 1 and cases[0].find('failure') is not None
+          assert cases[0].find('error') is None
+          PY
+      - name: Run camera tests and repository guards
+        run: >-
+          uv run pytest tests/src/unit/test_tools_camera.py
+          tests/src/unit/test_tools_camera_image_entities.py
+          tests/src/unit/test_core_reply_rules.py
+          tests/src/unit/test_stand_in_lists_ratchet.py
+          tests/src/unit/test_duplicate_code_ratchet.py
+          tests/src/unit/test_module_size_ratchet.py
+          tests/src/unit/test_tool_docstring_no_parameter_section.py -n logical --tb=short -q
+      - name: Run lint, types and ratchets
+        shell: bash
+        run: |
+          uv run ruff check src/ha_mcp/tools/tools_camera.py tests/src/unit/test_tools_camera.py tests/src/unit/test_tools_camera_image_entities.py tests/src/e2e/tools/test_camera.py
+          uv run ruff format --check src/ha_mcp/tools/tools_camera.py tests/src/unit/test_tools_camera.py tests/src/unit/test_tools_camera_image_entities.py tests/src/e2e/tools/test_camera.py
+          uv run ast-grep scan
+          uv run mypy src/ tests/src/unit/ tests/addon/
+          uv run python scripts/module_size_ratchet.py --base b205172
+          uv run python scripts/duplicate_code_ratchet.py --base b205172
+          uv run python scripts/stand_in_lists_ratchet.py --base b205172
+  camera-e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - mode: standalone
+            backend: ''
+            no_tools: ''
+          - mode: embedded
+            backend: embedded
+            no_tools: ''
+          - mode: server-entry-only
+            backend: embedded
+            no_tools: '1'
+          - mode: no-component
+            backend: ''
+            no_tools: '1'
+    env:
+      E2E_BACKEND: ${{ matrix.backend }}
+      E2E_NO_TOOLS_ENTRY: ${{ matrix.no_tools }}
+      HAMCP_ENV_FILE: tests/.env.test
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          submodules: true
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v5
+      - name: Check runner resources
+        run: df -h / && free -h && docker info --format '{{.ServerVersion}}'
+      - run: uv sync --python 3.14 --all-extras --dev
+      - name: Run camera E2E tests
+        working-directory: tests
+        run: uv run pytest src/e2e/tools/test_camera.py -v --tb=short
